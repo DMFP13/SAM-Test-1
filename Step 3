@@ -1,0 +1,152 @@
+# Step 1: Install dependencies
+!pip install torch torchvision
+!pip install git+https://github.com/facebookresearch/segment-anything.git
+!pip install opencv-python-headless
+
+# Step 2: Import necessary libraries
+import os
+import torch
+from segment_anything import sam_model_registry, SamPredictor
+import numpy as np
+import cv2
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from torchvision import transforms
+import torchvision.models as models
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+
+# Step 3: Load the SAM model
+model_checkpoint = "/content/drive/MyDrive/Data Sets for Collab/SAM PTH/sam_vit_h_4b8939.pth"
+
+# Check if the model checkpoint file exists
+if not os.path.exists(model_checkpoint):
+    raise FileNotFoundError(f"The model checkpoint file was not found at {model_checkpoint}. Please verify the path.")
+
+sam = sam_model_registry["vit_h"](checkpoint=model_checkpoint)
+
+# Step 4: Create the predictor
+device = "cuda" if torch.cuda.is_available() else "cpu"
+sam.to(device)
+predictor = SamPredictor(sam)
+
+# Step 5: Specify directories with images
+test_dir = "/content/drive/MyDrive/Data Sets for Collab/Milk Prod/A/A"
+
+# Step 6: Define a function to process images and extract masks
+def process_images(image_dir):
+    images = []
+    masks = []
+    
+    for image_name in os.listdir(image_dir):
+        if image_name.endswith(".JPG"):
+            # Load the image
+            image_path = os.path.join(image_dir, image_name)
+            image = Image.open(image_path)
+            image_np = np.array(image)
+
+            # Set the image for prediction
+            predictor.set_image(image_np)
+
+            # Use a center point prompt to identify the cow
+            input_point = np.array([[image_np.shape[1] // 2, image_np.shape[0] // 2]])
+            input_label = np.array([1])
+
+            masks_pred, _, _ = predictor.predict(point_coords=input_point, point_labels=input_label, multimask_output=False)
+
+            # Resize the image and mask to ensure consistent dimensions
+            image_resized = cv2.resize(image_np, (224, 224))
+            mask_resized = cv2.resize(masks_pred[0].astype(np.uint8), (224, 224))
+
+            # Save the resized image and mask
+            images.append(image_resized)
+            masks.append(mask_resized)
+    
+    return images, masks
+
+# Step 7: Process the test directory
+test_images, test_masks = process_images(test_dir)
+
+# Step 8: Prepare the test dataset
+class CowDataset(Dataset):
+    def __init__(self, images, masks, transform=None):
+        self.images = images
+        self.masks = masks
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        mask = self.masks[idx]
+        
+        # Convert image and mask to PIL images
+        image = Image.fromarray(image)
+        mask = Image.fromarray((mask * 255).astype(np.uint8))
+
+        if self.transform:
+            image = self.transform(image)
+            mask = transforms.ToTensor()(mask)  # Ensure mask is a tensor
+
+        # Create a label: 1 if there's a significant amount of cow, 0 otherwise
+        label = (mask.sum() > (0.1 * mask.numel())).float().unsqueeze(0)  # Set label to 1 if at least 10% of the pixels are cow
+
+        return image, label
+
+# Define transformations for the images
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# Create the test dataset and data loader
+test_dataset = CowDataset(test_images, test_masks, transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+
+# Step 9: Load the trained model
+model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+model.fc = nn.Sequential(
+    nn.Dropout(0.6),
+    nn.Linear(model.fc.in_features, 1)
+)
+model.load_state_dict(torch.load("/content/drive/MyDrive/Data Sets for Collab/cow_recognition_model_best.pth"))
+model = model.to(device)
+
+# Step 10: Evaluate the model on the test dataset
+model.eval()
+test_loss = 0.0
+correct = 0
+total = 0
+criterion = nn.BCEWithLogitsLoss()
+successful_images = []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        test_loss += loss.item()
+
+        predicted = (torch.sigmoid(outputs) > 0.5).float()
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+        # Save successful predictions
+        for i in range(len(predicted)):
+            if predicted[i] == labels[i] and len(successful_images) < 20:
+                successful_images.append(images[i].cpu().numpy().transpose(1, 2, 0))
+
+# Calculate accuracy on the test set
+test_accuracy = correct / total
+print(f"Test Loss: {test_loss/len(test_loader):.4f}, Test Accuracy: {test_accuracy:.4f}")
+
+# Step 11: Display 20 successful images
+plt.figure(figsize=(20, 10))
+for i, img in enumerate(successful_images):
+    plt.subplot(4, 5, i + 1)
+    plt.imshow(img)
+    plt.axis('off')
+plt.show()
